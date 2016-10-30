@@ -2,28 +2,37 @@
 //  LFVideoCapture.m
 //  LFLiveKit
 //
-//  Created by 倾慕 on 16/5/1.
-//  Copyright © 2016年 倾慕. All rights reserved.
+//  Created by LaiFeng on 16/5/20.
+//  Copyright © 2016年 LaiFeng All rights reserved.
 //
 
 #import "LFVideoCapture.h"
-#import "GPUImage.h"
 #import "LFGPUImageBeautyFilter.h"
 #import "LFGPUImageEmptyFilter.h"
+
+#if __has_include(<GPUImage/GPUImage.h>)
+#import <GPUImage/GPUImage.h>
+#elif __has_include("GPUImage/GPUImage.h")
+#import "GPUImage/GPUImage.h"
+#else
+#import "GPUImage.h"
+#endif
 
 @interface LFVideoCapture ()
 
 @property (nonatomic, strong) GPUImageVideoCamera *videoCamera;
-@property (nonatomic, weak) LFGPUImageBeautyFilter *beautyFilter;
+@property (nonatomic, strong) LFGPUImageBeautyFilter *beautyFilter;
 @property (nonatomic, strong) GPUImageOutput<GPUImageInput> *filter;
-@property (nonatomic, strong) GPUImageOutput<GPUImageInput> *output;
 @property (nonatomic, strong) GPUImageCropFilter *cropfilter;
+@property (nonatomic, strong) GPUImageOutput<GPUImageInput> *output;
 @property (nonatomic, strong) GPUImageView *gpuImageView;
 @property (nonatomic, strong) LFLiveVideoConfiguration *configuration;
 
 @property (nonatomic, strong) GPUImageAlphaBlendFilter *blendFilter;
 @property (nonatomic, strong) GPUImageUIElement *uiElementInput;
 @property (nonatomic, strong) UIView *waterMarkContentView;
+
+@property (nonatomic, strong) GPUImageMovieWriter *movieWriter;
 
 @end
 
@@ -37,14 +46,11 @@
 - (instancetype)initWithVideoConfiguration:(LFLiveVideoConfiguration *)configuration {
     if (self = [super init]) {
         _configuration = configuration;
-        if([self pixelBufferImageSize].width < configuration.videoSize.width || [self pixelBufferImageSize].height < configuration.videoSize.height){
-            @throw [NSException exceptionWithName:@"当前videoSize大小出错" reason:@"LFLiveVideoConfiguration videoSize error" userInfo:nil];
-            return nil;
-        }
 
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(willEnterBackground:) name:UIApplicationWillResignActiveNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(willEnterForeground:) name:UIApplicationDidBecomeActiveNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(statusBarChanged:) name:UIApplicationWillChangeStatusBarOrientationNotification object:nil];
+        
         self.beautyFace = YES;
         self.beautyLevel = 0.5;
         self.brightLevel = 0.5;
@@ -57,7 +63,11 @@
 - (void)dealloc {
     [UIApplication sharedApplication].idleTimerDisabled = NO;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [self.videoCamera stopCameraCapture];
+    [_videoCamera stopCameraCapture];
+    if(_gpuImageView){
+        [_gpuImageView removeFromSuperview];
+        _gpuImageView = nil;
+    }
 }
 
 #pragma mark -- Setter Getter
@@ -65,24 +75,8 @@
 - (GPUImageVideoCamera *)videoCamera{
     if(!_videoCamera){
         _videoCamera = [[GPUImageVideoCamera alloc] initWithSessionPreset:_configuration.avSessionPreset cameraPosition:AVCaptureDevicePositionFront];
-        UIInterfaceOrientation statusBar = [[UIApplication sharedApplication] statusBarOrientation];
-        if (self.configuration.landscape) {
-            if (statusBar != UIInterfaceOrientationLandscapeLeft && statusBar != UIInterfaceOrientationLandscapeRight) {
-                @throw [NSException exceptionWithName:@"当前设置方向出错" reason:@"LFLiveVideoConfiguration landscape error" userInfo:nil];
-                _videoCamera.outputImageOrientation = UIInterfaceOrientationLandscapeLeft;
-            } else {
-                _videoCamera.outputImageOrientation = statusBar;
-            }
-        } else {
-            if (statusBar != UIInterfaceOrientationPortrait && statusBar != UIInterfaceOrientationPortraitUpsideDown) {
-                @throw [NSException exceptionWithName:@"当前设置方向出错" reason:@"LFLiveVideoConfiguration landscape error" userInfo:nil];
-                _videoCamera.outputImageOrientation = UIInterfaceOrientationPortrait;
-            } else {
-                _videoCamera.outputImageOrientation = statusBar;
-            }
-        }
-        
-        _videoCamera.horizontallyMirrorFrontFacingCamera = YES;
+        _videoCamera.outputImageOrientation = _configuration.outputImageOrientation;
+        _videoCamera.horizontallyMirrorFrontFacingCamera = NO;
         _videoCamera.horizontallyMirrorRearFacingCamera = NO;
         _videoCamera.frameRate = (int32_t)_configuration.videoFrameRate;
     }
@@ -96,18 +90,19 @@
     if (!_running) {
         [UIApplication sharedApplication].idleTimerDisabled = NO;
         [self.videoCamera stopCameraCapture];
+        if(self.saveLocalVideo) [self.movieWriter finishRecording];
     } else {
         [UIApplication sharedApplication].idleTimerDisabled = YES;
         [self reloadFilter];
         [self.videoCamera startCameraCapture];
+        if(self.saveLocalVideo) [self.movieWriter startRecording];
     }
 }
 
 - (void)setPreView:(UIView *)preView {
     if (self.gpuImageView.superview) [self.gpuImageView removeFromSuperview];
     [preView insertSubview:self.gpuImageView atIndex:0];
-    self.gpuImageView.bounds = preView.bounds;
-    self.waterMarkContentView.bounds = preView.bounds;
+    self.gpuImageView.frame = CGRectMake(0, 0, preView.frame.size.width, preView.frame.size.height);
 }
 
 - (UIView *)preView {
@@ -117,6 +112,7 @@
 - (void)setCaptureDevicePosition:(AVCaptureDevicePosition)captureDevicePosition {
     [self.videoCamera rotateCamera];
     self.videoCamera.frameRate = (int32_t)_configuration.videoFrameRate;
+    [self reloadMirror];
 }
 
 - (AVCaptureDevicePosition)captureDevicePosition {
@@ -163,8 +159,6 @@
 
 - (void)setMirror:(BOOL)mirror {
     _mirror = mirror;
-    self.videoCamera.horizontallyMirrorRearFacingCamera = mirror;
-    self.videoCamera.horizontallyMirrorFrontFacingCamera = mirror;
 }
 
 - (void)setBeautyFace:(BOOL)beautyFace{
@@ -239,7 +233,7 @@
 - (UIView *)waterMarkContentView{
     if(!_waterMarkContentView){
         _waterMarkContentView = [UIView new];
-        _waterMarkContentView.frame = CGRectMake(0, 0, self.gpuImageView.frame.size.width, self.gpuImageView.frame.size.height);
+        _waterMarkContentView.frame = CGRectMake(0, 0, self.configuration.videoSize.width, self.configuration.videoSize.height);
         _waterMarkContentView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     }
     return _waterMarkContentView;
@@ -253,17 +247,31 @@
     }
     return _gpuImageView;
 }
+
 -(UIImage *)currentImage{
-    [_filter useNextFrameForImageCapture];
-    return _filter.imageFromCurrentFramebuffer;
+    if(_filter){
+        [_filter useNextFrameForImageCapture];
+        return _filter.imageFromCurrentFramebuffer;
+    }
+    return nil;
 }
+
+- (GPUImageMovieWriter*)movieWriter{
+    if(!_movieWriter){
+        _movieWriter = [[GPUImageMovieWriter alloc] initWithMovieURL:self.saveLocalVideoPath size:self.configuration.videoSize];
+        _movieWriter.encodingLiveVideo = YES;
+        _movieWriter.shouldPassthroughAudio = YES;
+        self.videoCamera.audioEncodingTarget = self.movieWriter;
+    }
+    return _movieWriter;
+}
+
 #pragma mark -- Custom Method
 - (void)processVideo:(GPUImageOutput *)output {
     __weak typeof(self) _self = self;
     @autoreleasepool {
         GPUImageFramebuffer *imageFramebuffer = output.framebufferForOutput;
         CVPixelBufferRef pixelBuffer = [imageFramebuffer pixelBuffer];
-
         if (pixelBuffer && _self.delegate && [_self.delegate respondsToSelector:@selector(captureOutput:pixelBuffer:)]) {
             [_self.delegate captureOutput:_self pixelBuffer:pixelBuffer];
         }
@@ -272,58 +280,69 @@
 
 - (void)reloadFilter{
     [self.filter removeAllTargets];
-    [self.cropfilter removeAllTargets];
     [self.blendFilter removeAllTargets];
     [self.uiElementInput removeAllTargets];
     [self.videoCamera removeAllTargets];
-   
+    [self.output removeAllTargets];
+    [self.cropfilter removeAllTargets];
     
     if (self.beautyFace) {
         self.output = [[LFGPUImageEmptyFilter alloc] init];
         self.filter = [[LFGPUImageBeautyFilter alloc] init];
-        self.beautyFilter = self.filter;
-        __weak typeof(self) _self = self;
-        [self.output setFrameProcessingCompletionBlock:^(GPUImageOutput *output, CMTime time) {
-            [_self processVideo:output];
-        }];
+        self.beautyFilter = (LFGPUImageBeautyFilter*)self.filter;
     } else {
+        self.output = [[LFGPUImageEmptyFilter alloc] init];
         self.filter = [[LFGPUImageEmptyFilter alloc] init];
         self.beautyFilter = nil;
-        __weak typeof(self) _self = self;
-        [self.filter setFrameProcessingCompletionBlock:^(GPUImageOutput *output, CMTime time) {
-            [_self processVideo:output];
-        }];
     }
     
-    CGSize imageSize = [self pixelBufferImageSize];
-    CGFloat cropLeft = (imageSize.width - self.configuration.videoSize.width)/2.0/imageSize.width;
-    CGFloat cropTop = (imageSize.height - self.configuration.videoSize.height)/2.0/imageSize.height;
+    ///< 调节镜像
+    [self reloadMirror];
     
-    if(cropLeft == 0 && cropTop == 0){
-        [self.videoCamera addTarget:_filter];
-    }else{
-        self.cropfilter = [[GPUImageCropFilter alloc] initWithCropRegion:CGRectMake(cropLeft, cropTop, 1 - cropLeft*2, 1 - cropTop*2)];
+    //< 480*640 比例为4:3  强制转换为16:9
+    if([self.configuration.avSessionPreset isEqualToString:AVCaptureSessionPreset640x480]){
+        CGRect cropRect = self.configuration.landscape ? CGRectMake(0, 0.125, 1, 0.75) : CGRectMake(0.125, 0, 0.75, 1);
+        self.cropfilter = [[GPUImageCropFilter alloc] initWithCropRegion:cropRect];
         [self.videoCamera addTarget:self.cropfilter];
         [self.cropfilter addTarget:self.filter];
+    }else{
+        [self.videoCamera addTarget:self.filter];
     }
     
+    //< 添加水印
     if(self.warterMarkView){
         [self.filter addTarget:self.blendFilter];
         [self.uiElementInput addTarget:self.blendFilter];
         [self.blendFilter addTarget:self.gpuImageView];
-        if(self.beautyFace){
-            [self.filter addTarget:self.output];
-        }
+        if(self.saveLocalVideo) [self.blendFilter addTarget:self.movieWriter];
+        [self.filter addTarget:self.output];
         [self.uiElementInput update];
     }else{
-        if (self.beautyFace) {
-            [self.filter addTarget:self.output];
-            [self.output addTarget:self.gpuImageView];
-        } else {
-            [self.filter addTarget:self.gpuImageView];
-        }
+        [self.filter addTarget:self.output];
+        [self.output addTarget:self.gpuImageView];
+        if(self.saveLocalVideo) [self.output addTarget:self.movieWriter];
     }
     
+    [self.filter forceProcessingAtSize:self.configuration.videoSize];
+    [self.output forceProcessingAtSize:self.configuration.videoSize];
+    [self.blendFilter forceProcessingAtSize:self.configuration.videoSize];
+    [self.uiElementInput forceProcessingAtSize:self.configuration.videoSize];
+    
+    
+    //< 输出数据
+    __weak typeof(self) _self = self;
+    [self.output setFrameProcessingCompletionBlock:^(GPUImageOutput *output, CMTime time) {
+        [_self processVideo:output];
+    }];
+    
+}
+
+- (void)reloadMirror{
+    if(self.mirror && self.captureDevicePosition == AVCaptureDevicePositionFront){
+        self.videoCamera.horizontallyMirrorFrontFacingCamera = YES;
+    }else{
+        self.videoCamera.horizontallyMirrorFrontFacingCamera = NO;
+    }
 }
 
 #pragma mark Notification
@@ -344,49 +363,22 @@
 - (void)statusBarChanged:(NSNotification *)notification {
     NSLog(@"UIApplicationWillChangeStatusBarOrientationNotification. UserInfo: %@", notification.userInfo);
     UIInterfaceOrientation statusBar = [[UIApplication sharedApplication] statusBarOrientation];
-    if (self.configuration.landscape) {
-        if (statusBar == UIInterfaceOrientationLandscapeLeft) {
-            self.videoCamera.outputImageOrientation = UIInterfaceOrientationLandscapeRight;
-        } else if (statusBar == UIInterfaceOrientationLandscapeRight) {
-            self.videoCamera.outputImageOrientation = UIInterfaceOrientationLandscapeLeft;
-        }
-    } else {
-        if (statusBar == UIInterfaceOrientationPortrait) {
-            self.videoCamera.outputImageOrientation = UIInterfaceOrientationPortraitUpsideDown;
-        } else if (statusBar == UIInterfaceOrientationPortraitUpsideDown) {
-            self.videoCamera.outputImageOrientation = UIInterfaceOrientationPortrait;
-        }
-    }
-}
 
-#pragma mark -- 
-- (CGSize)pixelBufferImageSize{
-    CGSize videoSize = CGSizeZero;
-    switch (self.configuration.sessionPreset) {
-        case LFCaptureSessionPreset360x640:
-        {
-            videoSize = CGSizeMake(480, 640);
+    if(self.configuration.autorotate){
+        if (self.configuration.landscape) {
+            if (statusBar == UIInterfaceOrientationLandscapeLeft) {
+                self.videoCamera.outputImageOrientation = UIInterfaceOrientationLandscapeRight;
+            } else if (statusBar == UIInterfaceOrientationLandscapeRight) {
+                self.videoCamera.outputImageOrientation = UIInterfaceOrientationLandscapeLeft;
+            }
+        } else {
+            if (statusBar == UIInterfaceOrientationPortrait) {
+                self.videoCamera.outputImageOrientation = UIInterfaceOrientationPortraitUpsideDown;
+            } else if (statusBar == UIInterfaceOrientationPortraitUpsideDown) {
+                self.videoCamera.outputImageOrientation = UIInterfaceOrientationPortrait;
+            }
         }
-            break;
-        case LFCaptureSessionPreset540x960:
-        {
-            videoSize = CGSizeMake(540, 960);
-        }
-            break;
-        case LFCaptureSessionPreset720x1280:
-        {
-            videoSize = CGSizeMake(720, 1280);
-        }
-            break;
-            
-        default:
-            break;
     }
-    
-    if(self.configuration.landscape){
-        return CGSizeMake(videoSize.height, videoSize.width);
-    }
-    return videoSize;
 }
 
 @end
